@@ -1,0 +1,161 @@
+# Компоновка для служб анализа безопасности и качества кода
+# Использование (примеры):
+#   docker compose -f compose.security.yaml up semgrep
+#   docker compose -f compose.security.yaml up trivy-fs
+#   docker compose -f compose.security.yaml up gitleaks
+#   docker compose -f compose.security.yaml up depcheck
+#   docker compose -f compose.security.yaml up dotnet-vuln
+#   docker compose -f compose.security.yaml up -d sonarqube && docker compose -f compose.security.yaml run --rm sonar-scanner
+# Отчёты сохраняются в каталоге ./out
+
+services:
+  # SonarQube сервер для метрик качества кода и некоторых уязвимостей
+  sonarqube:
+    image: sonarqube:10-community
+    ports:
+      - 9000:9000
+    environment:
+      - SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_logs:/opt/sonarqube/logs
+      - sonarqube_extensions:/opt/sonarqube/extensions
+
+  # CLI сканер Sonar (требуется токен проекта)
+  sonar-scanner:
+    image: sonarsource/sonar-scanner-cli:latest
+    depends_on:
+      - sonarqube
+    working_dir: /workspace
+    environment:
+      - SONAR_HOST_URL=http://sonarqube:9000
+      # Установите переменную SONAR_TOKEN через .env или при запуске:
+      #   SONAR_TOKEN=xxxxx docker compose -f compose.security.yaml run --rm sonar-scanner
+      # или добавьте в .env: SONAR_TOKEN=xxxxx
+      - SONAR_TOKEN
+    volumes:
+      - ./:/workspace:ro
+      - ./out:/out
+    command: |
+      sh -lc "
+        if [ -f sonar-project.properties ]; then
+          sonar-scanner -Dsonar.login=$SONAR_TOKEN
+        else
+          # Сканирование без файла настроек: переопределяем ключи
+          sonar-scanner \
+            -Dsonar.projectKey=data-checker \
+            -Dsonar.projectName=data-checker \
+            -Dsonar.sources=. \
+            -Dsonar.host.url=$SONAR_HOST_URL \
+            -Dsonar.login=$SONAR_TOKEN
+        fi
+      "
+
+  # Полноценное сканирование C# с помощью SonarScanner for .NET (MSBuild)
+  sonar-scanner-dotnet:
+    image: mcr.microsoft.com/dotnet/sdk:8.0
+    depends_on:
+      - sonarqube
+    working_dir: /workspace
+    environment:
+      - SONAR_HOST_URL=http://sonarqube:9000
+      - SONAR_TOKEN
+    volumes:
+      - ./:/workspace
+      - ./out:/out
+      - nuget_cache:/root/.nuget/packages
+    command: |
+      sh -lc "
+        dotnet tool update --global dotnet-sonarscanner || dotnet tool install --global dotnet-sonarscanner && \
+        export PATH=\"$PATH:/root/.dotnet/tools\" && \
+        dotnet-sonarscanner begin /k:\"data-checker\" /n:\"data-checker\" /d:sonar.host.url=\"$SONAR_HOST_URL\" /d:sonar.login=\"$SONAR_TOKEN\" && \
+        dotnet restore && dotnet build --no-restore && \
+        dotnet-sonarscanner end /d:sonar.login=\"$SONAR_TOKEN\"
+      "
+
+  # Поиск уязвимостей, misconfig и секретов по исходникам
+  semgrep:
+    image: returntocorp/semgrep:latest
+    working_dir: /src
+    volumes:
+      - ./:/src:ro
+      - ./out:/out
+    command: >-
+      semgrep scan --config auto --error --timeout 600
+      --json --output /out/semgrep.json
+
+  # Trivy: файловая система (исходники, IaC, секреты)
+  trivy-fs:
+    image: aquasec/trivy:latest
+    working_dir: /src
+    volumes:
+      - ./:/src:ro
+      - ./out:/out
+    command: >-
+      trivy fs --scanners vuln,secret,config,license --skip-dirs obj --skip-dirs bin
+      --format sarif --output /out/trivy-fs.sarif /src
+
+  # Trivy: скан Docker-образа проекта (предварительно соберите образ)
+  trivy-image:
+    image: aquasec/trivy:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./out:/out
+    # По умолчанию сканируем образ datachecker:latest из вашего compose
+    command: >-
+      trivy image --format sarif --output /out/trivy-image.sarif datachecker:latest
+
+  # Gitleaks: поиск секретов в репозитории
+  gitleaks:
+    image: zricethezav/gitleaks:latest
+    working_dir: /src
+    volumes:
+      - ./:/src:ro
+      - ./out:/out
+    command: >-
+      detect --source /src --verbose
+      --report-format sarif --report-path /out/gitleaks.sarif
+
+  # OWASP Dependency-Check: анализ зависимостей (включая .NET NuGet)
+  depcheck:
+    image: owasp/dependency-check:latest
+    user: "1000:1000"
+    volumes:
+      - ./:/src:ro
+      - ./out:/out
+      - depcheck_data:/usr/share/dependency-check/data
+    command: >-
+      --scan /src --format "HTML,JSON,XML" --out /out
+      --project data-checker --enableExperimental
+
+  # .NET уязвимости пакетов через официальные инструменты
+  dotnet-vuln:
+    image: mcr.microsoft.com/dotnet/sdk:8.0
+    working_dir: /workspace/DataChecker
+    volumes:
+      - ./:/workspace
+      - ./out:/out
+    command: |
+      sh -lc "
+        dotnet restore && \
+        dotnet list package --vulnerable --include-transitive | tee /out/dotnet_vulnerable.txt
+      "
+
+  # Линтер Dockerfile
+  hadolint:
+    image: hadolint/hadolint:latest-alpine
+    working_dir: /src
+    volumes:
+      - ./:/src:ro
+      - ./out:/out
+    command: >-
+      hadolint /src/DataChecker/Dockerfile -f sarif -o /out/hadolint.sarif
+
+volumes:
+  sonarqube_data:
+  sonarqube_logs:
+  sonarqube_extensions:
+  depcheck_data:
+  nuget_cache:
+
+
