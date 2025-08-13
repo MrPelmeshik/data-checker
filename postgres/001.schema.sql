@@ -1,4 +1,4 @@
-create database if not exists data_checker;
+-- create database if not exists data_checker;
 
 create table if not exists rules (
     id serial primary key,

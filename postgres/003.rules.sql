@@ -184,6 +184,19 @@ select object_id, true as is_fail
 from test_data
 order by pg_sleep(0.01)
 ', 'Запрещенная функция в Sort Key: pg_sleep')
+,       (41, '
+ with 
+valid_res as (
+    select  object_id
+    ,       (count(*) filter (where value_1 > 45)) > 1 as is_fail
+    from test_data
+    where value_2 > 25   
+    group by object_id
+    having object_id > 2
+)
+select  object_id
+,       is_fail
+from valid_res', 'Запрос с константой')
 on conflict (id) do nothing ;
 
 
